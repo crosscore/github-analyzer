@@ -36,7 +36,14 @@ class GitHubRepoAnalyzer:
             return self.content_cache[file_api_url]
         response = requests.get(file_api_url, headers=self.headers)
         response.raise_for_status()
-        content = base64.b64decode(response.json()['content']).decode('utf-8')
+        json_resp = response.json()
+        if 'content' not in json_resp:
+            self.content_cache[file_api_url] = "Non-text content or unexpected format."
+            return self.content_cache[file_api_url]
+        try:
+            content = base64.b64decode(json_resp['content']).decode('utf-8')
+        except Exception:
+            content = "Error decoding content (possibly binary file)."
         self.content_cache[file_api_url] = content
         return content
 
@@ -67,16 +74,11 @@ class GitHubRepoAnalyzer:
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
     with open(output_file, 'w', encoding='utf-8') as f:
-        # Markdown header for repository structure
         f.write("# Repository Structure\n\n")
-        # output as code block for markdown
         f.write("```\n")
         f.write("\n".join(structure))
         f.write("\n```\n\n")
-        
-        # Markdown header for file contents
         f.write("# File Contents\n\n")
-        # output as code block for markdown for each file
         for path, content in contents.items():
             f.write(f"## {path}\n\n")
             f.write("```\n")
@@ -94,7 +96,9 @@ def main():
     try:
         structure, contents = analyzer.analyze_repo()
         save_analysis(structure, contents, output_file)
-        print(f"\nAnalysis completed successfully. Results saved to {output_file}")
+        # Get absolute path for output_file and display it.
+        full_output_path = os.path.abspath(output_file)
+        print(f"\nAnalysis completed successfully. Results saved to:\n{full_output_path}")
     except Exception as e:
         print(f"Error: {str(e)}")
 
