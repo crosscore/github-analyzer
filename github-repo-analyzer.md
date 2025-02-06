@@ -1,8 +1,180 @@
+# Repository Structure
+
+```
+├── src
+│   ├── test.py
+│   └── test2.py
+├── .gitignore
+├── README.md
+└── main.py
+```
+
+# File Contents
+
+## src/test.py
+
+```
+print("Hello, World!")
+```
+
+## src/test2.py
+
+```
+print("Hello, World!")
+```
+
+## .gitignore
+
+```
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+.pypirc
+
+.DS_Store
+*.txt
+```
+
+## README.md
+
+```
+# github-repo-analyzer
+```
+
+## main.py
+
+```
 import os
 import re
 import requests
 import base64
 from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 class GitHubRepoAnalyzer:
     def __init__(self, token: str, repo_url: str):
@@ -13,8 +185,8 @@ class GitHubRepoAnalyzer:
 
     def _parse_github_url(self, url: str) -> Tuple[str, str]:
         patterns = [
-            r'github\.com[:/]([^/]+)/([^/\.]+)(?:\.git)?$',  # HTTPS/SSH URL
-            r'github\.com/([^/]+)/([^/]+)/?$'  # Web URL
+            r'github\.com[:/]([^/]+)/([^/\.]+)(?:\.git)?$',  # Handles HTTPS and SSH URLs
+            r'github\.com/([^/]+)/([^/]+)/?$'  # Handles web URLs
         ]
         for pattern in patterns:
             match = re.search(pattern, url)
@@ -46,17 +218,14 @@ class GitHubRepoAnalyzer:
 
         def process_path(path: str, prefix: str = ''):
             items = self.get_contents(path)
-            items = sorted(items, key=lambda x: (x['type'] != 'dir', x['name']))
-            count = len(items)
-            for idx, item in enumerate(items):
-                connector = '└── ' if idx == count - 1 else '├── '
+            for item in sorted(items, key=lambda x: (x['type'] != 'dir', x['name'])):
                 full_path = f"{path}/{item['name']}" if path else item['name']
-                structure_path = f"{prefix}{connector}{item['name']}"
-                structure.append(structure_path)
+                structure_path = f"{prefix}{'├── ' if prefix else ''}{item['name']}"
                 if item['type'] == 'dir':
-                    new_prefix = prefix + ('    ' if idx == count - 1 else '│   ')
-                    process_path(full_path, new_prefix)
+                    structure.append(structure_path)
+                    process_path(full_path, prefix + '│   ')
                 else:
+                    structure.append(structure_path)
                     try:
                         contents[full_path] = self.get_file_content(item['url'])
                     except Exception as e:
@@ -67,21 +236,14 @@ class GitHubRepoAnalyzer:
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
     with open(output_file, 'w', encoding='utf-8') as f:
-        # Markdown header for repository structure
-        f.write("# Repository Structure\n\n")
-        # output as code block for markdown
-        f.write("```\n")
-        f.write("\n".join(structure))
-        f.write("\n```\n\n")
-        
-        # Markdown header for file contents
-        f.write("# File Contents\n\n")
-        # output as code block for markdown for each file
+        f.write('\n'.join(structure) + '\n\n')
+        # Improved file content header for clarity
         for path, content in contents.items():
-            f.write(f"## {path}\n\n")
-            f.write("```\n")
+            f.write('---\n')
+            f.write(f'File: {path}\n')
+            f.write('---\n')
             f.write(content)
-            f.write("\n```\n\n")
+            f.write('\n\n')
 
 def main():
     token = os.getenv('GITHUB_TOKEN')
@@ -90,7 +252,7 @@ def main():
         return
     repo_url = input('GitHub repository URL: ')
     analyzer = GitHubRepoAnalyzer(token, repo_url)
-    output_file = f"{analyzer.repo}.md"
+    output_file = f"{analyzer.repo}.txt"
     try:
         structure, contents = analyzer.analyze_repo()
         save_analysis(structure, contents, output_file)
@@ -100,3 +262,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+```
+
