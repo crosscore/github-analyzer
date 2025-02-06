@@ -43,7 +43,6 @@ class GitHubRepoAnalyzer:
     def analyze_repo(self) -> Tuple[List[str], Dict[str, str]]:
         structure = []
         contents = {}
-        processed_files = set()  # Track processed file paths
 
         def process_path(path: str, prefix: str = ''):
             items = self.get_contents(path)
@@ -58,19 +57,13 @@ class GitHubRepoAnalyzer:
                     new_prefix = prefix + ('    ' if idx == count - 1 else '│   ')
                     process_path(full_path, new_prefix)
                 else:
-                    # Skip if already processed
-                    if full_path in processed_files:
-                        continue
                     try:
                         contents[full_path] = self.get_file_content(item['url'])
-                        processed_files.add(full_path)
                     except Exception as e:
                         contents[full_path] = f"Error reading file: {str(e)}"
-                        processed_files.add(full_path)
 
         process_path('')
         return structure, contents
-
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
     with open(output_file, 'w', encoding='utf-8') as f:
