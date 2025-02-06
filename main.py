@@ -164,6 +164,17 @@ def main():
         save_analysis(structure, contents, output_file)
         full_output_path = os.path.abspath(output_file)
         print(f"\nAnalysis completed successfully. Results saved to:\n{full_output_path}")
+
+        # Calculate token count of the output file using tiktoken
+        try:
+            import tiktoken
+            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+            with open(output_file, "r", encoding="utf-8") as f:
+                output_text = f.read()
+            token_count = len(encoding.encode(output_text))
+            print(f"Token count: {token_count} tokens")
+        except ImportError:
+            print("tiktoken is not installed. Please install it via 'pip install tiktoken' to compute token count.")
     except Exception as e:
         print(f"Error: {str(e)}")
 
