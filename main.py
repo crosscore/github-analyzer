@@ -4,6 +4,14 @@ import json
 import requests
 import base64
 from typing import Dict, List, Tuple
+import cursor
+import sys
+import time
+from tqdm import tqdm
+
+# ANSI escape codes for highlighting
+HIGHLIGHT_START = '\033[47;30m'
+HIGHLIGHT_END = '\033[0m'
 
 class GitHubRepoAnalyzer:
     def __init__(self, token: str, repo_url: str):
@@ -13,7 +21,6 @@ class GitHubRepoAnalyzer:
         self.content_cache: Dict[str, str] = {}
 
     def _parse_github_url(self, url: str) -> Tuple[str, str]:
-        # Parse the GitHub URL to extract the owner and repository name
         patterns = [
             r'github\.com[:/]([^/]+)/([^/\.]+)(?:\.git)?$',  # HTTPS/SSH URL
             r'github\.com/([^/]+)/([^/]+)/?$'  # Web URL
@@ -29,13 +36,11 @@ class GitHubRepoAnalyzer:
         )
 
     def get_contents(self, path: str = '') -> List[Dict]:
-        # Retrieve repository contents at the given path
         response = requests.get(f'{self.base_url}/contents/{path}', headers=self.headers)
         response.raise_for_status()
         return response.json()
 
     def get_file_content(self, file_api_url: str) -> str:
-        # Retrieve and decode file content from its API URL
         if file_api_url in self.content_cache:
             return self.content_cache[file_api_url]
         response = requests.get(file_api_url, headers=self.headers)
@@ -52,7 +57,6 @@ class GitHubRepoAnalyzer:
         return content
 
     def analyze_repo(self) -> Tuple[List[str], Dict[str, str]]:
-        # Analyze repository structure and retrieve file contents
         structure = []
         contents = {}
 
@@ -70,6 +74,7 @@ class GitHubRepoAnalyzer:
                     process_path(full_path, new_prefix)
                 else:
                     try:
+                        tqdm.write(f"Fetching: {full_path}")
                         contents[full_path] = self.get_file_content(item['url'])
                     except Exception as e:
                         contents[full_path] = f"Error reading file: {str(e)}"
@@ -78,7 +83,6 @@ class GitHubRepoAnalyzer:
         return structure, contents
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
-    # Save the repository analysis result as a Markdown file
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("# Repository Structure\n\n")
         f.write("```\n")
@@ -92,7 +96,6 @@ def save_analysis(structure: List[str], contents: Dict[str, str], output_file: s
             f.write("\n```\n\n")
 
 def load_repos(repo_db_file: str) -> List[str]:
-    # Load repository URLs from a JSON file
     if os.path.exists(repo_db_file):
         with open(repo_db_file, 'r', encoding='utf-8') as f:
             try:
@@ -104,9 +107,64 @@ def load_repos(repo_db_file: str) -> List[str]:
     return []
 
 def save_repos(repos: List[str], repo_db_file: str):
-    # Save repository URLs to a JSON file
     with open(repo_db_file, 'w', encoding='utf-8') as f:
         json.dump(repos, f, ensure_ascii=False, indent=4)
+
+def get_repo_choice(repos: List[str]) -> str | None:
+    """Displays a list of repositories and lets the user choose one."""
+
+    current_selection = 0
+    repo_url = None
+
+    with cursor.HiddenCursor():
+        while True:
+            print("\033[?25l")  # Hide cursor
+            print("\033[H\033[J")  # Clear screen
+            print("Saved GitHub repository URLs:")
+
+            for idx, url in enumerate(repos):
+                if idx == current_selection:
+                    print(f"{HIGHLIGHT_START}{idx + 1}. {url}{HIGHLIGHT_END}")
+                else:
+                    print(f"{idx + 1}. {url}")
+
+            print(f"{HIGHLIGHT_START if len(repos) == current_selection else ''}{len(repos) + 1}. Input new repository.{HIGHLIGHT_END if len(repos) == current_selection else ''}")
+
+            key = getch()
+
+            if key == '\x1b[A' or key == 'k':  # Up arrow or 'k'
+                current_selection = max(0, current_selection - 1)
+            elif key == '\x1b[B' or key == 'j':  # Down arrow or 'j'
+                current_selection = min(len(repos), current_selection + 1)
+            elif key == '\r':  # Enter key
+                if current_selection < len(repos):
+                    repo_url = repos[current_selection]
+                else:
+                    repo_url = input("Enter a new GitHub repository URL: ").strip()
+                break
+            elif key == '\x1b': # ESC
+                return None
+    return repo_url
+
+def getch():
+    """Gets a single character from standard input."""
+    if os.name == 'nt':  # Windows
+        import msvcrt
+        return msvcrt.getch().decode('utf-8', 'ignore')
+    else:  # Linux/macOS
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+
+            # Handle arrow keys
+            if ch == '\x1b':
+                ch += sys.stdin.read(2)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
 
 def main():
     token = os.getenv('GITHUB_TOKEN')
@@ -114,7 +172,6 @@ def main():
         print("Error: GITHUB_TOKEN environment variable is not set")
         return
 
-    # Set output directories based on the directory containing main.py
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "output")
     output_md_dir = os.path.join(output_dir, "md")
@@ -123,49 +180,32 @@ def main():
     os.makedirs(output_json_dir, exist_ok=True)
 
     repos_file = os.path.join(output_json_dir, "repos.json")
-
     repos = load_repos(repos_file)
-    repo_url = None
 
-    if repos:
-        print("Saved GitHub repository URLs:")
-        for idx, url in enumerate(repos, start=1):
-            print(f"{idx}. {url}")
-        print("0. Enter a new repository URL")
-        choice = input("Please select a number: ").strip()
-        try:
-            choice_num = int(choice)
-            if choice_num == 0:
-                repo_url = input("Enter a new GitHub repository URL: ").strip()
-            elif 1 <= choice_num <= len(repos):
-                repo_url = repos[choice_num - 1]
-            else:
-                print("Invalid number selected.")
-                return
-        except ValueError:
-            # Treat non-numeric input as a new URL
-            repo_url = choice
-    else:
-        repo_url = input("Enter GitHub repository URL: ").strip()
+    repo_url = get_repo_choice(repos)
 
     if not repo_url:
-        print("Repository URL was not entered.")
+        print("Operation cancelled.")
         return
 
-    # If the URL is new, add it to the list and save it
     if repo_url not in repos:
         repos.append(repo_url)
         save_repos(repos, repos_file)
 
+
     analyzer = GitHubRepoAnalyzer(token, repo_url)
     output_file = os.path.join(output_md_dir, f"{analyzer.repo}.md")
+
     try:
-        structure, contents = analyzer.analyze_repo()
+        with tqdm(desc="Analyzing repository", unit="file") as pbar:
+            structure, contents = analyzer.analyze_repo()
+            pbar.total = len(contents)
+            pbar.update(pbar.total)
+
         save_analysis(structure, contents, output_file)
         full_output_path = os.path.abspath(output_file)
         print(f"\nAnalysis completed successfully. Results saved to:\n{full_output_path}")
 
-        # Calculate token count of the output file using tiktoken
         try:
             import tiktoken
             encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
@@ -175,8 +215,10 @@ def main():
             print(f"Token count: {token_count} tokens")
         except ImportError:
             print("tiktoken is not installed. Please install it via 'pip install tiktoken' to compute token count.")
+
     except Exception as e:
         print(f"Error: {str(e)}")
+
 
 if __name__ == '__main__':
     main()
