@@ -4,21 +4,30 @@ import json
 import base64
 import asyncio
 import aiohttp
+import time  # for caching timestamps
+import aiofiles  # asynchronous file I/O
 from typing import Dict, List, Tuple
 import cursor
 import sys
 from tqdm import tqdm
+
+# Cache expiration for git tree (in seconds, e.g., 1 hour)
+CACHE_EXPIRY_SECONDS = 3600
+
+# Directory name for persistent file cache
+FILE_CACHE_DIR_NAME = "file_cache"
 
 # ANSI escape codes for highlighting
 HIGHLIGHT_START = '\033[47;30m'
 HIGHLIGHT_END = '\033[0m'
 
 class GitHubRepoAnalyzer:
-    def __init__(self, token: str, repo_url: str):
+    def __init__(self, token: str, repo_url: str, file_cache_dir: str):
         self.token = token
         self.owner, self.repo = self._parse_github_url(repo_url)
         self.base_url = f'https://api.github.com/repos/{self.owner}/{self.repo}'
         self.content_cache: Dict[str, str] = {}
+        self.file_cache_dir = file_cache_dir
 
     def _parse_github_url(self, url: str) -> Tuple[str, str]:
         patterns = [
@@ -37,9 +46,21 @@ class GitHubRepoAnalyzer:
             response.raise_for_status()
             return await response.json()
 
-    async def get_file_content(self, file_api_url: str, session: aiohttp.ClientSession) -> str:
+    async def get_file_content(self, file_api_url: str, session: aiohttp.ClientSession, sha: str = None) -> str:
+        # Use memory cache if available
         if file_api_url in self.content_cache:
             return self.content_cache[file_api_url]
+        # If file cache exists (when SHA is provided), read from the file cache asynchronously
+        if sha:
+            cache_path = os.path.join(self.file_cache_dir, f"{sha}.cache")
+            if os.path.exists(cache_path):
+                try:
+                    async with aiofiles.open(cache_path, 'r', encoding='utf-8') as cf:
+                        content = await cf.read()
+                    self.content_cache[file_api_url] = content
+                    return content
+                except Exception:
+                    pass
         async with session.get(file_api_url) as response:
             response.raise_for_status()
             json_resp = await response.json()
@@ -51,6 +72,13 @@ class GitHubRepoAnalyzer:
             except Exception:
                 content = "Error decoding content (possibly binary file)."
             self.content_cache[file_api_url] = content
+            # Save to persistent cache asynchronously
+            if sha:
+                try:
+                    async with aiofiles.open(cache_path, 'w', encoding='utf-8') as cf:
+                        await cf.write(content)
+                except Exception:
+                    pass
             return content
 
     async def get_default_branch(self, session: aiohttp.ClientSession) -> str:
@@ -60,53 +88,67 @@ class GitHubRepoAnalyzer:
             data = await response.json()
             return data['default_branch']
 
-    async def count_files_tree(self, session: aiohttp.ClientSession) -> int:
+    async def get_git_tree(self, session: aiohttp.ClientSession) -> List[Dict]:
+        # Retrieve the entire repository tree with a single API request
         default_branch = await self.get_default_branch(session)
         tree_url = f'{self.base_url}/git/trees/{default_branch}?recursive=1'
         async with session.get(tree_url) as response:
             response.raise_for_status()
             tree_json = await response.json()
-            tree = tree_json.get('tree', [])
-            return sum(1 for item in tree if item.get('type') == 'blob')
+            return tree_json.get('tree', [])
 
-    async def analyze_repo(self, session: aiohttp.ClientSession, pbar) -> Tuple[List[str], Dict[str, str], int]:
-        structure = []
-        file_api_urls = {}
+    async def analyze_repo(self, session: aiohttp.ClientSession, pbar, tree: List[Dict] = None) -> Tuple[List[str], Dict[str, str], int]:
+        if tree is None:
+            tree = await self.get_git_tree(session)
+        nested = build_nested_dict(tree)
+        structure = nested_dict_to_tree_str(nested)
+        # file_api_data: { file_path: (api_url, sha) }
+        file_api_data = {
+            item['path']: (item['url'], item.get('sha'))
+            for item in tree if item.get('type') == 'blob'
+        }
+        file_count = len(file_api_data)
 
-        # Recursively traverse repository structure
-        async def process_path(path: str, prefix: str = ''):
-            items = await self.get_contents(path, session)
-            items = sorted(items, key=lambda x: (x['type'] != 'dir', x['name']))
-            count = len(items)
-            for idx, item in enumerate(items):
-                connector = '└── ' if idx == count - 1 else '├── '
-                full_path = f"{path}/{item['name']}" if path else item['name']
-                structure.append(f"{prefix}{connector}{item['name']}")
-                if item['type'] == 'dir':
-                    new_prefix = prefix + ('    ' if idx == count - 1 else '│   ')
-                    await process_path(full_path, new_prefix)
-                else:
-                    file_api_urls[full_path] = item['url']
-
-        await process_path('')
-        file_count = len(file_api_urls)
-        contents = {}
-
-        # Concurrently fetch file contents with progress update
-        async def fetch_with_progress(path: str, url: str):
+        async def fetch_with_progress(path: str, url: str, sha: str):
             try:
-                content = await self.get_file_content(url, session)
+                content = await self.get_file_content(url, session, sha)
             except Exception as e:
                 content = f"Error reading file: {str(e)}"
             pbar.update(1)
-            tqdm.write(f"Fetched: {path}")
             return path, content
 
-        tasks = [fetch_with_progress(path, url) for path, url in file_api_urls.items()]
+        tasks = [fetch_with_progress(path, url, sha) for path, (url, sha) in file_api_data.items()]
         results = await asyncio.gather(*tasks)
-        for path, content in results:
-            contents[path] = content
+        contents = {path: content for path, content in results}
         return structure, contents, file_count
+
+# helper functions
+def build_nested_dict(tree: List[Dict]) -> dict:
+    nested = {}
+    for item in tree:
+        parts = item['path'].split('/')
+        node = nested
+        for i, part in enumerate(parts):
+            if i == len(parts) - 1:
+                if item['type'] == 'tree':
+                    node.setdefault(part, {})
+                else:  # blob (file)
+                    node[part] = None
+            else:
+                node = node.setdefault(part, {})
+    return nested
+
+def nested_dict_to_tree_str(nested: dict, prefix="") -> List[str]:
+    lines = []
+    keys = sorted(nested.keys(), key=lambda k: (0 if isinstance(nested[k], dict) else 1, k.lower()))
+    for i, key in enumerate(keys):
+        is_last = i == len(keys) - 1
+        connector = "└── " if is_last else "├── "
+        lines.append(prefix + connector + key)
+        if isinstance(nested[key], dict):
+            new_prefix = prefix + ("    " if is_last else "│   ")
+            lines.extend(nested_dict_to_tree_str(nested[key], new_prefix))
+    return lines
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -135,6 +177,22 @@ def load_repos(repo_db_file: str) -> List[str]:
 def save_repos(repos: List[str], repo_db_file: str):
     with open(repo_db_file, 'w', encoding='utf-8') as f:
         json.dump(repos, f, ensure_ascii=False, indent=4)
+
+async def load_git_tree_cache(cache_path: str) -> List[Dict] | None:
+    if os.path.exists(cache_path):
+        try:
+            mtime = os.path.getmtime(cache_path)
+            if (time.time() - mtime) < CACHE_EXPIRY_SECONDS:
+                async with aiofiles.open(cache_path, 'r', encoding='utf-8') as f:
+                    file_content = await f.read()
+                return json.loads(file_content)
+        except Exception:
+            pass
+    return None
+
+async def save_git_tree_cache(cache_path: str, tree: List[Dict]):
+    async with aiofiles.open(cache_path, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(tree, ensure_ascii=False, indent=4))
 
 def get_repo_choice(repos: List[str]) -> str | None:
     options = repos + ["Enter new repository", "Exit"]
@@ -197,8 +255,10 @@ async def main_async():
     output_dir = os.path.join(script_dir, "output")
     output_md_dir = os.path.join(output_dir, "md")
     output_json_dir = os.path.join(output_dir, "json")
+    file_cache_dir = os.path.join(output_json_dir, FILE_CACHE_DIR_NAME)
     os.makedirs(output_md_dir, exist_ok=True)
     os.makedirs(output_json_dir, exist_ok=True)
+    os.makedirs(file_cache_dir, exist_ok=True)
 
     repos_file = os.path.join(output_json_dir, "repos.json")
     repos = load_repos(repos_file)
@@ -210,13 +270,22 @@ async def main_async():
         repos.append(repo_url)
         save_repos(repos, repos_file)
 
-    analyzer = GitHubRepoAnalyzer(token, repo_url)
+    analyzer = GitHubRepoAnalyzer(token, repo_url, file_cache_dir)
     headers = {'Authorization': f'token {token}'}
     async with aiohttp.ClientSession(headers=headers) as session:
-        total_files = await analyzer.count_files_tree(session)
+        # Use cached git tree if available (async file I/O)
+        cache_file = os.path.join(output_json_dir, f"{analyzer.owner}_{analyzer.repo}_tree.json")
+        cached_tree = await load_git_tree_cache(cache_file)
+        if cached_tree is None:
+            tree = await analyzer.get_git_tree(session)
+            await save_git_tree_cache(cache_file, tree)
+        else:
+            tree = cached_tree
+
+        total_files = sum(1 for item in tree if item.get('type') == 'blob')
         output_file = os.path.join(output_md_dir, f"{analyzer.repo}.md")
         with tqdm(total=total_files, desc="Analyzing repository", unit="file") as pbar:
-            structure, contents, _ = await analyzer.analyze_repo(session, pbar)
+            structure, contents, _ = await analyzer.analyze_repo(session, pbar, tree)
         save_analysis(structure, contents, output_file)
         full_output_path = os.path.abspath(output_file)
         print(f"\nAnalysis completed successfully. Results saved to:\n{full_output_path}")
