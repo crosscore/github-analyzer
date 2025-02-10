@@ -296,7 +296,7 @@ async def main_async():
             with open(output_file, "r", encoding="utf-8") as f:
                 output_text = f.read()
             token_count = len(encoding.encode(output_text))
-            print(f"Token count: {token_count} tokens")
+            print(f"Token count: \033[1;33m{token_count}\033[0m tokens")
         except ImportError:
             print("tiktoken is not installed. Please install it via 'pip install tiktoken' to compute token count.")
 
