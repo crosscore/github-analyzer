@@ -179,7 +179,11 @@ async def load_git_tree_cache(cache_path: str) -> Dict | None:
         try:
             async with aiofiles.open(cache_path, 'r', encoding='utf-8') as f:
                 file_content = await f.read()
-            return json.loads(file_content)
+            data = json.loads(file_content)
+            # If the cached data is not a dict (e.g. from an older version), ignore it.
+            if not isinstance(data, dict):
+                return None
+            return data
         except Exception:
             pass
     return None
