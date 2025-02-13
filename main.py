@@ -47,10 +47,8 @@ class GitHubRepoAnalyzer:
             return await response.json()
 
     async def get_file_content(self, file_api_url: str, session: aiohttp.ClientSession, sha: str = None) -> str:
-        # Use memory cache if available
         if file_api_url in self.content_cache:
             return self.content_cache[file_api_url]
-        # If file cache exists (when SHA is provided), read from the file cache asynchronously
         if sha:
             cache_path = os.path.join(self.file_cache_dir, f"{sha}.cache")
             if os.path.exists(cache_path):
@@ -72,7 +70,6 @@ class GitHubRepoAnalyzer:
             except Exception:
                 content = "Error decoding content (possibly binary file)."
             self.content_cache[file_api_url] = content
-            # Save to persistent cache asynchronously
             if sha:
                 try:
                     async with aiofiles.open(cache_path, 'w', encoding='utf-8') as cf:
@@ -88,21 +85,20 @@ class GitHubRepoAnalyzer:
             data = await response.json()
             return data['default_branch']
 
-    async def get_git_tree(self, session: aiohttp.ClientSession) -> List[Dict]:
-        # Retrieve the entire repository tree with a single API request
+    async def get_git_tree(self, session: aiohttp.ClientSession) -> Dict:
+        # Return full JSON (including tree SHA) to allow commit SHA comparison
         default_branch = await self.get_default_branch(session)
         tree_url = f'{self.base_url}/git/trees/{default_branch}?recursive=1'
         async with session.get(tree_url) as response:
             response.raise_for_status()
-            tree_json = await response.json()
-            return tree_json.get('tree', [])
+            return await response.json()
 
     async def analyze_repo(self, session: aiohttp.ClientSession, pbar, tree: List[Dict] = None) -> Tuple[List[str], Dict[str, str], int]:
         if tree is None:
             tree = await self.get_git_tree(session)
+            tree = tree.get("tree", [])
         nested = build_nested_dict(tree)
         structure = nested_dict_to_tree_str(nested)
-        # file_api_data: { file_path: (api_url, sha) }
         file_api_data = {
             item['path']: (item['url'], item.get('sha'))
             for item in tree if item.get('type') == 'blob'
@@ -132,7 +128,7 @@ def build_nested_dict(tree: List[Dict]) -> dict:
             if i == len(parts) - 1:
                 if item['type'] == 'tree':
                     node.setdefault(part, {})
-                else:  # blob (file)
+                else:
                     node[part] = None
             else:
                 node = node.setdefault(part, {})
@@ -178,19 +174,17 @@ def save_repos(repos: List[str], repo_db_file: str):
     with open(repo_db_file, 'w', encoding='utf-8') as f:
         json.dump(repos, f, ensure_ascii=False, indent=4)
 
-async def load_git_tree_cache(cache_path: str) -> List[Dict] | None:
+async def load_git_tree_cache(cache_path: str) -> Dict | None:
     if os.path.exists(cache_path):
         try:
-            mtime = os.path.getmtime(cache_path)
-            if (time.time() - mtime) < CACHE_EXPIRY_SECONDS:
-                async with aiofiles.open(cache_path, 'r', encoding='utf-8') as f:
-                    file_content = await f.read()
-                return json.loads(file_content)
+            async with aiofiles.open(cache_path, 'r', encoding='utf-8') as f:
+                file_content = await f.read()
+            return json.loads(file_content)
         except Exception:
             pass
     return None
 
-async def save_git_tree_cache(cache_path: str, tree: List[Dict]):
+async def save_git_tree_cache(cache_path: str, tree: Dict):
     async with aiofiles.open(cache_path, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(tree, ensure_ascii=False, indent=4))
 
@@ -273,15 +267,26 @@ async def main_async():
     analyzer = GitHubRepoAnalyzer(token, repo_url, file_cache_dir)
     headers = {'Authorization': f'token {token}'}
     async with aiohttp.ClientSession(headers=headers) as session:
-        # Use cached git tree if available (async file I/O)
         cache_file = os.path.join(output_json_dir, f"{analyzer.owner}_{analyzer.repo}_tree.json")
-        cached_tree = await load_git_tree_cache(cache_file)
-        if cached_tree is None:
-            tree = await analyzer.get_git_tree(session)
-            await save_git_tree_cache(cache_file, tree)
-        else:
-            tree = cached_tree
+        cached_data = await load_git_tree_cache(cache_file)
 
+        # Retrieve current commit SHA for the default branch
+        default_branch = await analyzer.get_default_branch(session)
+        branch_url = f'https://api.github.com/repos/{analyzer.owner}/{analyzer.repo}/branches/{default_branch}'
+        async with session.get(branch_url) as response:
+            response.raise_for_status()
+            branch_data = await response.json()
+        current_commit_sha = branch_data["commit"]["sha"]
+
+        # If cache is missing or outdated (commit SHA changed), update cache
+        if cached_data is None or cached_data.get("sha") != current_commit_sha:
+            tree_json = await analyzer.get_git_tree(session)
+            tree_json["cached_at"] = time.time()
+            await save_git_tree_cache(cache_file, tree_json)
+        else:
+            tree_json = cached_data
+
+        tree = tree_json.get("tree", [])
         total_files = sum(1 for item in tree if item.get('type') == 'blob')
         output_file = os.path.join(output_md_dir, f"{analyzer.repo}.md")
         with tqdm(total=total_files, desc="Analyzing repository", unit="file") as pbar:
