@@ -4,12 +4,13 @@ import json
 import base64
 import asyncio
 import aiohttp
-import time  # for caching timestamps
-import aiofiles  # asynchronous file I/O
+import time  # For caching timestamps
+import aiofiles  # Asynchronous file I/O
 from typing import Dict, List, Tuple
 import cursor
 import sys
 from tqdm import tqdm
+import tiktoken  # For token counting
 
 # Cache expiration for git tree (in seconds, e.g., 1 hour)
 CACHE_EXPIRY_SECONDS = 3600
@@ -30,6 +31,7 @@ class GitHubRepoAnalyzer:
         self.file_cache_dir = file_cache_dir
 
     def _parse_github_url(self, url: str) -> Tuple[str, str]:
+        # Parse GitHub URL to extract owner and repo name
         patterns = [
             r'github\.com[:/]([^/]+)/([^/\.]+)(?:\.git)?$',  # HTTPS/SSH URL
             r'github\.com/([^/]+)/([^/]+)/?$'  # Web URL
@@ -41,12 +43,14 @@ class GitHubRepoAnalyzer:
         raise ValueError("Invalid GitHub URL. Expected format: https://github.com/owner/repo or git@github.com:owner/repo.git")
 
     async def get_contents(self, path: str, session: aiohttp.ClientSession) -> List[Dict]:
+        # Fetch contents of a directory from GitHub API
         url = f'{self.base_url}/contents/{path}' if path else f'{self.base_url}/contents'
         async with session.get(url) as response:
             response.raise_for_status()
             return await response.json()
 
     async def get_file_content(self, file_api_url: str, session: aiohttp.ClientSession, sha: str = None) -> str:
+        # Fetch file content, using cache if available
         if file_api_url in self.content_cache:
             return self.content_cache[file_api_url]
         if sha:
@@ -79,6 +83,7 @@ class GitHubRepoAnalyzer:
             return content
 
     async def get_default_branch(self, session: aiohttp.ClientSession) -> str:
+        # Get the default branch of the repository
         url = f'https://api.github.com/repos/{self.owner}/{self.repo}'
         async with session.get(url) as response:
             response.raise_for_status()
@@ -86,14 +91,15 @@ class GitHubRepoAnalyzer:
             return data['default_branch']
 
     async def get_git_tree(self, session: aiohttp.ClientSession) -> Dict:
-        # Return full JSON (including tree SHA) to allow commit SHA comparison
+        # Fetch the recursive git tree for the default branch
         default_branch = await self.get_default_branch(session)
         tree_url = f'{self.base_url}/git/trees/{default_branch}?recursive=1'
         async with session.get(tree_url) as response:
             response.raise_for_status()
             return await response.json()
 
-    async def analyze_repo(self, session: aiohttp.ClientSession, pbar, tree: List[Dict] = None) -> Tuple[List[str], Dict[str, str], int]:
+    async def analyze_repo(self, session: aiohttp.ClientSession, pbar, tree: List[Dict] = None) -> Tuple[List[str], Dict[str, str], int, List[Tuple[str, int]]]:
+        # Analyze the repository: structure, contents, file count, and token counts
         if tree is None:
             tree = await self.get_git_tree(session)
             tree = tree.get("tree", [])
@@ -116,10 +122,22 @@ class GitHubRepoAnalyzer:
         tasks = [fetch_with_progress(path, url, sha) for path, (url, sha) in file_api_data.items()]
         results = await asyncio.gather(*tasks)
         contents = {path: content for path, content in results}
-        return structure, contents, file_count
 
-# helper functions
+        # Calculate token counts for each file
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        token_counts = []
+        for path, content in contents.items():
+            try:
+                token_count = len(encoding.encode(content))
+                token_counts.append((path, token_count))
+            except Exception as e:
+                print(f"Error calculating token count for {path}: {str(e)}")
+
+        return structure, contents, file_count, token_counts
+
+# Helper functions
 def build_nested_dict(tree: List[Dict]) -> dict:
+    # Build a nested dictionary from the git tree
     nested = {}
     for item in tree:
         parts = item['path'].split('/')
@@ -135,6 +153,7 @@ def build_nested_dict(tree: List[Dict]) -> dict:
     return nested
 
 def nested_dict_to_tree_str(nested: dict, prefix="") -> List[str]:
+    # Convert nested dictionary to a tree string representation
     lines = []
     keys = sorted(nested.keys(), key=lambda k: (0 if isinstance(nested[k], dict) else 1, k.lower()))
     for i, key in enumerate(keys):
@@ -147,6 +166,7 @@ def nested_dict_to_tree_str(nested: dict, prefix="") -> List[str]:
     return lines
 
 def save_analysis(structure: List[str], contents: Dict[str, str], output_file: str):
+    # Save the repository structure and file contents to a markdown file
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("# Repository Structure\n\n")
         f.write("```\n")
@@ -160,6 +180,7 @@ def save_analysis(structure: List[str], contents: Dict[str, str], output_file: s
             f.write("\n```\n\n")
 
 def load_repos(repo_db_file: str) -> List[str]:
+    # Load list of repositories from a JSON file
     if os.path.exists(repo_db_file):
         with open(repo_db_file, 'r', encoding='utf-8') as f:
             try:
@@ -171,16 +192,17 @@ def load_repos(repo_db_file: str) -> List[str]:
     return []
 
 def save_repos(repos: List[str], repo_db_file: str):
+    # Save list of repositories to a JSON file
     with open(repo_db_file, 'w', encoding='utf-8') as f:
         json.dump(repos, f, ensure_ascii=False, indent=4)
 
 async def load_git_tree_cache(cache_path: str) -> Dict | None:
+    # Load cached git tree from a JSON file
     if os.path.exists(cache_path):
         try:
             async with aiofiles.open(cache_path, 'r', encoding='utf-8') as f:
                 file_content = await f.read()
             data = json.loads(file_content)
-            # If the cached data is not a dict (e.g. from an older version), ignore it.
             if not isinstance(data, dict):
                 return None
             return data
@@ -189,10 +211,12 @@ async def load_git_tree_cache(cache_path: str) -> Dict | None:
     return None
 
 async def save_git_tree_cache(cache_path: str, tree: Dict):
+    # Save git tree to a JSON cache file
     async with aiofiles.open(cache_path, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(tree, ensure_ascii=False, indent=4))
 
 def get_repo_choice(repos: List[str]) -> str | None:
+    # Interactive menu to choose a repository
     options = repos + ["Enter new repository", "Exit"]
     current_selection = 0
     repo_url = None
@@ -227,6 +251,7 @@ def get_repo_choice(repos: List[str]) -> str | None:
     return repo_url
 
 def getch():
+    # Get a single character from input (platform-dependent)
     if os.name == 'nt':  # Windows
         import msvcrt
         return msvcrt.getch().decode('utf-8', 'ignore')
@@ -244,6 +269,7 @@ def getch():
         return ch
 
 async def main_async():
+    # Main asynchronous function to run the analysis
     token = os.getenv('GITHUB_TOKEN')
     if not token:
         print("Error: GITHUB_TOKEN environment variable is not set")
@@ -282,7 +308,7 @@ async def main_async():
             branch_data = await response.json()
         current_commit_sha = branch_data["commit"]["sha"]
 
-        # If cache is missing or outdated (commit SHA changed), update cache
+        # If cache is missing or outdated, update it
         if cached_data is None or cached_data.get("sha") != current_commit_sha:
             tree_json = await analyzer.get_git_tree(session)
             tree_json["cached_at"] = time.time()
@@ -294,22 +320,25 @@ async def main_async():
         total_files = sum(1 for item in tree if item.get('type') == 'blob')
         output_file = os.path.join(output_md_dir, f"{analyzer.repo}.md")
         with tqdm(total=total_files, desc="Analyzing repository", unit="file") as pbar:
-            structure, contents, _ = await analyzer.analyze_repo(session, pbar, tree)
+            structure, contents, _, token_counts = await analyzer.analyze_repo(session, pbar, tree)
         save_analysis(structure, contents, output_file)
         full_output_path = os.path.abspath(output_file)
         print(f"\nAnalysis completed successfully. Results saved to:\n{full_output_path}")
 
-        try:
-            import tiktoken
-            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-            with open(output_file, "r", encoding="utf-8") as f:
-                output_text = f.read()
-            token_count = len(encoding.encode(output_text))
-            print(f"Token count: \033[1;33m{token_count}\033[0m tokens")
-        except ImportError:
-            print("tiktoken is not installed. Please install it via 'pip install tiktoken' to compute token count.")
+        # Sort token counts in ascending order
+        token_counts.sort(key=lambda x: x[1])
+
+        # Output individual file token counts in ascending order
+        print("\nIndividual file token counts (ascending order):")
+        for path, token_count in token_counts:
+            print(f"{path}: \033[1;33m{token_count}\033[0m tokens")
+
+        # Calculate and output total token count
+        total_tokens = sum(token_count for _, token_count in token_counts)
+        print(f"\nTotal token count: \033[1;33m{total_tokens}\033[0m tokens")
 
 def main():
+    # Entry point to run the async main function
     asyncio.run(main_async())
 
 if __name__ == '__main__':

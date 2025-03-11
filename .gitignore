@@ -131,4 +131,4 @@ cython_debug/
 .DS_Store
 *.txt
 output/
-memo.md
+memo*.md
